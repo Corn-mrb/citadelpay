@@ -47,10 +47,11 @@ const config = {
   },
   emojiTips: {
     "⚡": 21,
-    "1ZAP": 1,
-    "21ZAP": 21,
-    "210ZAP": 210,
-    "2100ZAP": 2100
+    "CP_1ZAP": 1,
+    "CP_8ZAP": 8,
+    "CP_21ZAP": 21,
+    "CP_210ZAP": 210,
+    "CP_2100ZAP": 2100
   }
 };
 
@@ -69,7 +70,7 @@ validateConfig();
 const blinkApi = axios.create({
   baseURL: config.blink.endpoint,
   headers: { "X-API-KEY": config.blink.apiKey, "Content-Type": "application/json" },
-  timeout: 10000
+  timeout: 30000
 });
 
 const gql = async (query, variables = {}) => {
@@ -133,6 +134,48 @@ const blink = {
     );
     if (data.lnNoAmountInvoicePaymentSend.errors?.length) throw new Error(data.lnNoAmountInvoicePaymentSend.errors[0].message);
     return data.lnNoAmountInvoicePaymentSend.status;
+  },
+
+  verifyOutgoingPayment: async (paymentRequest) => {
+    try {
+      const decoded = bolt11.decode(paymentRequest);
+      const targetHash = decoded.sections?.find(s => s.name === "payment_hash")?.value;
+      if (!targetHash) return null;
+
+      await sleep(3000);
+      const data = await gql(`
+        query {
+          me {
+            defaultAccount {
+              transactions(first: 10) {
+                edges {
+                  node {
+                    direction
+                    status
+                    initiationVia {
+                      ... on InitiationViaLn {
+                        paymentHash
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `);
+
+      const txs = data.me.defaultAccount.transactions.edges;
+      for (const { node } of txs) {
+        if (node.direction === "SEND" && node.initiationVia?.paymentHash === targetHash) {
+          return node.status;
+        }
+      }
+      return "NOT_FOUND";
+    } catch (e) {
+      console.error("Payment verification failed:", e.message);
+      return null;
+    }
   }
 };
 
@@ -167,6 +210,12 @@ const owner = {
   reset: () => balance.set(OWNER_ID, 0)
 };
 
+// ============ Transaction Log ============
+const txLog = (type, data) => {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), type, ...data });
+  fs.appendFileSync("./citadelpay_tx.log", entry + "\n");
+};
+
 // ============ Utils ============
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -197,6 +246,7 @@ const watchInvoice = async (pr, uid, amount) => {
       const status = await blink.checkInvoice(pr);
       if (status === "PAID") {
         balance.add(uid, amount);
+        txLog("deposit", { uid, amount, bal: balance.get(uid) });
         console.log(`✅ +${amount} sats → ${uid}`);
         return;
       }
@@ -225,6 +275,7 @@ const expireRedpacket = async (msgId, channelId) => {
 
   if (refund > 0) {
     balance.add(pkt.creatorId, refund);
+    txLog("redpacket_refund", { uid: pkt.creatorId, amount: refund, bal: balance.get(pkt.creatorId) });
     try {
       const user = await client.users.fetch(pkt.creatorId);
       await user.send(`🎁 **Expired!**\n👥 ${claimed}/${pkt.count}\n💸 Refund: **${refund} sats**\n💰 Balance: **${balance.get(pkt.creatorId)} sats**`);
@@ -307,6 +358,7 @@ client.on("messageReactionAdd", async (reaction, user) => {
     if (reaction.partial) await reaction.fetch();
     if (reaction.message.partial) await reaction.message.fetch();
 
+    console.log(`[DEBUG] emoji: name="${reaction.emoji.name}" id=${reaction.emoji.id}`);
     const amount = config.emojiTips[reaction.emoji.name];
     if (!amount) return;
 
@@ -323,6 +375,7 @@ client.on("messageReactionAdd", async (reaction, user) => {
 
     balance.sub(user.id, amount);
     balance.add(author.id, amount);
+    txLog("emoji_tip", { from: user.id, to: author.id, amount, emoji: reaction.emoji.name });
 
     await reaction.message.channel.send(`⚡ <@${user.id}> ➡️ <@${author.id}> **${amount} sats** tip!`);
 
@@ -348,6 +401,7 @@ client.on("interactionCreate", async (i) => {
         if ((pkt.claimedBy?.length || 0) >= pkt.count) return i.reply({ content: "❌ All claimed", ephemeral: true });
 
         balance.add(i.user.id, pkt.per);
+        txLog("redpacket_claim", { uid: i.user.id, amount: pkt.per, from: pkt.creatorId, bal: balance.get(i.user.id) });
         pkt.claimedBy = [...(pkt.claimedBy || []), i.user.id];
         redpacketStore.set(i.message.id, pkt);
 
@@ -400,9 +454,32 @@ client.on("interactionCreate", async (i) => {
 
           if (balance.get(i.user.id) < total) return i.editReply(`❌ Balance: ${balance.get(i.user.id)} (Need: ${total})`);
 
-          await blink.pay(inv);
+          // 잔액 먼저 차감 (이중지불 방지)
           balance.sub(i.user.id, total);
           if (fee > 0) owner.add(fee);
+          txLog("withdraw", { uid: i.user.id, amount: amt, fee, dest: addr, status: "pending" });
+
+          try {
+            await blink.pay(inv);
+            txLog("withdraw", { uid: i.user.id, amount: amt, dest: addr, status: "success" });
+          } catch (payErr) {
+            console.error(`⚠️ Withdraw error (${i.user.id}): ${amt} sats → ${addr} - ${payErr.message}`);
+            const status = await blink.verifyOutgoingPayment(inv);
+            if (status === "NOT_FOUND") {
+              balance.add(i.user.id, total);
+              if (fee > 0) owner.add(-fee);
+              txLog("withdraw", { uid: i.user.id, amount: amt, dest: addr, status: "refunded", reason: payErr.message });
+              throw payErr;
+            } else if (status === "SUCCESS" || status === "PENDING") {
+              txLog("withdraw", { uid: i.user.id, amount: amt, dest: addr, status: "verified_" + status, reason: payErr.message });
+              console.log(`✅ Verified: payment ${status} despite error (${i.user.id})`);
+              return i.editReply(`⚠️ **에러 발생했지만 결제 확인됨**\n📤 ${amt} sats ➡️ \`${addr}\`\n💰 Balance: **${balance.get(i.user.id)} sats**`);
+            } else {
+              txLog("withdraw", { uid: i.user.id, amount: amt, dest: addr, status: "unverified", reason: payErr.message });
+              console.error(`⚠️ Cannot verify payment (${i.user.id}) - keeping deduction`);
+              return i.editReply(`⚠️ **에러 발생 - 결제 확인 불가**\n잔액이 차감되었으며, 미처리시 관리자에게 문의하세요.\n💰 Balance: **${balance.get(i.user.id)} sats**`);
+            }
+          }
 
           await i.editReply(`✅ **Sent!**\n📤 ${amt} sats ➡️ \`${addr}\`\n💸 Fee: ${fee || "Free"}\n💰 Balance: **${balance.get(i.user.id)} sats**`);
         } catch (e) { await i.editReply(`❌ ${e.message}`); }
@@ -428,14 +505,36 @@ client.on("interactionCreate", async (i) => {
 
           if (balance.get(i.user.id) < total) return i.editReply(`❌ Balance: ${balance.get(i.user.id)} (Need: ${total})`);
 
-          if (amtOpt && !invAmt) {
-            await blink.payZeroAmount(inv, amt);
-          } else {
-            await blink.pay(inv);
-          }
-
+          // 잔액 먼저 차감 (이중지불 방지)
           balance.sub(i.user.id, total);
           if (fee > 0) owner.add(fee);
+          txLog("withdraw", { uid: i.user.id, amount: amt, fee, dest: "invoice", status: "pending" });
+
+          try {
+            if (amtOpt && !invAmt) {
+              await blink.payZeroAmount(inv, amt);
+            } else {
+              await blink.pay(inv);
+            }
+            txLog("withdraw", { uid: i.user.id, amount: amt, dest: "invoice", status: "success" });
+          } catch (payErr) {
+            console.error(`⚠️ Withdraw error (${i.user.id}): ${amt} sats invoice - ${payErr.message}`);
+            const status = await blink.verifyOutgoingPayment(inv);
+            if (status === "NOT_FOUND") {
+              balance.add(i.user.id, total);
+              if (fee > 0) owner.add(-fee);
+              txLog("withdraw", { uid: i.user.id, amount: amt, dest: "invoice", status: "refunded", reason: payErr.message });
+              throw payErr;
+            } else if (status === "SUCCESS" || status === "PENDING") {
+              txLog("withdraw", { uid: i.user.id, amount: amt, dest: "invoice", status: "verified_" + status, reason: payErr.message });
+              console.log(`✅ Verified: payment ${status} despite error (${i.user.id})`);
+              return i.editReply(`⚠️ **에러 발생했지만 결제 확인됨**\n📤 ${amt} sats\n💰 Balance: **${balance.get(i.user.id)} sats**`);
+            } else {
+              txLog("withdraw", { uid: i.user.id, amount: amt, dest: "invoice", status: "unverified", reason: payErr.message });
+              console.error(`⚠️ Cannot verify payment (${i.user.id}) - keeping deduction`);
+              return i.editReply(`⚠️ **에러 발생 - 결제 확인 불가**\n잔액이 차감되었으며, 미처리시 관리자에게 문의하세요.\n💰 Balance: **${balance.get(i.user.id)} sats**`);
+            }
+          }
 
           await i.editReply(`✅ **Sent!**\n📤 ${amt} sats\n💸 Fee: ${fee || "Free"}\n💰 Balance: **${balance.get(i.user.id)} sats**`);
         } catch (e) { await i.editReply(`❌ ${e.message}`); }
@@ -479,12 +578,14 @@ client.on("interactionCreate", async (i) => {
 
         balance.sub(uid, amt);
         balance.add(target.id, amt);
-
-        try { await target.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n💰 Balance: **${balance.get(target.id)} sats**`); } catch {}
+        txLog("tip", { from: uid, to: target.id, amount: amt });
 
         let reply = `⚡ <@${uid}> ➡️ <@${target.id}> **${amt} sats** tip!`;
         if (msg) reply += `\n💬 ${msg}`;
-        return i.reply({ content: reply });
+        await i.reply({ content: reply });
+
+        try { await target.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n💰 Balance: **${balance.get(target.id)} sats**`); } catch {}
+        return;
       }
 
       case "withdraw": {
@@ -509,6 +610,7 @@ client.on("interactionCreate", async (i) => {
         if (balance.get(uid) < total) return i.reply({ content: `❌ Balance: ${balance.get(uid)} (Need: ${total})`, ephemeral: true });
 
         balance.sub(uid, total);
+        txLog("redpacket_create", { uid, amount: total, per, count });
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId("redpacket_claim").setLabel("🎁 CLAIM").setStyle(ButtonStyle.Primary)
@@ -541,6 +643,7 @@ client.on("interactionCreate", async (i) => {
 
         balance.sub(OWNER_ID, amt);
         balance.add(uid, amt);
+        txLog("owner_withdraw", { uid, amount: amt });
         return i.reply({ content: `✅ Owner ➡️ You **${amt} sats**`, ephemeral: true });
       }
 
