@@ -603,7 +603,7 @@ client.on("interactionCreate", async (i) => {
         for (const u of resolved) {
           balance.add(u.id, amt);
           txLog("tip", { from: uid, to: u.id, amount: amt });
-          try { await u.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n💰 Balance: **${balance.get(u.id)} sats**`); } catch {}
+          try { await u.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n📍 <#${i.channelId}>\n💰 Balance: **${balance.get(u.id)} sats**`); } catch {}
         }
 
         const mentions = resolved.map(u => `<@${u.id}>`).join(", ");
