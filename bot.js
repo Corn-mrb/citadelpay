@@ -380,7 +380,7 @@ client.on("messageReactionAdd", async (reaction, user) => {
     await reaction.message.channel.send(`⚡ <@${user.id}> ➡️ <@${author.id}> **${amount} sats** tip!`);
 
     try {
-      await author.send(`⚡ <@${user.id}> ➡️ You **${amount} sats**\n💰 Balance: **${balance.get(author.id)} sats**`);
+      await author.send(`⚡ <@${user.id}> ➡️ You **${amount} sats**\n📍 <#${reaction.message.channelId}>\n💰 Balance: **${balance.get(author.id)} sats**`);
     } catch {}
 
     console.log(`⚡ ${user.id} → ${author.id}: ${amount} sats`);
