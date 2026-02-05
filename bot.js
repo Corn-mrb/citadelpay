@@ -321,8 +321,8 @@ const commands = [
 
   new SlashCommandBuilder().setName("tip").setDescription("Send sats")
     .setDescriptionLocalizations({ ko: "sats 보내기", ja: "sats送金", "es-ES": "Enviar sats" })
-    .addUserOption(o => o.setName("user").setDescription("Recipient").setDescriptionLocalizations({ ko: "받는 사람", ja: "受取人", "es-ES": "Destinatario" }).setRequired(true))
-    .addIntegerOption(o => o.setName("amount").setDescription("Amount (sats)").setDescriptionLocalizations({ ko: "금액 (sats)", ja: "金額 (sats)", "es-ES": "Cantidad (sats)" }).setRequired(true))
+    .addStringOption(o => o.setName("users").setDescription("Recipients (@user1 @user2 ...)").setDescriptionLocalizations({ ko: "받는 사람 (@유저1 @유저2 ...)", ja: "受取人 (@user1 @user2 ...)", "es-ES": "Destinatarios (@user1 @user2 ...)" }).setRequired(true))
+    .addIntegerOption(o => o.setName("amount").setDescription("Amount per person (sats)").setDescriptionLocalizations({ ko: "1인당 금액 (sats)", ja: "1人当たりの金額 (sats)", "es-ES": "Cantidad por persona (sats)" }).setRequired(true))
     .addStringOption(o => o.setName("message").setDescription("Message").setDescriptionLocalizations({ ko: "메시지", ja: "メッセージ", "es-ES": "Mensaje" }).setRequired(false)),
 
   new SlashCommandBuilder().setName("withdraw").setDescription("Withdraw sats")
@@ -568,23 +568,48 @@ client.on("interactionCreate", async (i) => {
       }
 
       case "tip": {
-        const target = i.options.getUser("user");
+        const usersInput = i.options.getString("users");
         const amt = i.options.getInteger("amount");
         const msg = i.options.getString("message");
 
         if (amt <= 0) return i.reply({ content: "❌ Amount > 0", ephemeral: true });
-        if (target.bot) return i.reply({ content: "❌ Can't tip bots", ephemeral: true });
-        if (balance.get(uid) < amt) return i.reply({ content: `❌ Balance: ${balance.get(uid)} sats`, ephemeral: true });
 
-        balance.sub(uid, amt);
-        balance.add(target.id, amt);
-        txLog("tip", { from: uid, to: target.id, amount: amt });
+        // 멘션에서 유저 ID 추출
+        const userIds = [...new Set(usersInput.match(/<@!?(\d+)>/g)?.map(m => m.replace(/<@!?|>/g, "")) || [])];
+        if (!userIds.length) return i.reply({ content: "❌ @멘션으로 유저를 지정하세요", ephemeral: true });
 
-        let reply = `⚡ <@${uid}> ➡️ <@${target.id}> **${amt} sats** tip!`;
+        // 자기 자신 제외
+        const targets = userIds.filter(id => id !== uid);
+        if (!targets.length) return i.reply({ content: "❌ 자신에게는 팁을 보낼 수 없습니다", ephemeral: true });
+
+        const total = amt * targets.length;
+        if (balance.get(uid) < total) return i.reply({ content: `❌ Balance: ${balance.get(uid)} sats (Need: ${total})`, ephemeral: true });
+
+        // 봇 체크
+        const resolved = [];
+        for (const id of targets) {
+          try {
+            const u = await client.users.fetch(id);
+            if (u.bot) continue;
+            resolved.push(u);
+          } catch {}
+        }
+        if (!resolved.length) return i.reply({ content: "❌ 유효한 유저가 없습니다", ephemeral: true });
+
+        const finalTotal = amt * resolved.length;
+        if (balance.get(uid) < finalTotal) return i.reply({ content: `❌ Balance: ${balance.get(uid)} sats (Need: ${finalTotal})`, ephemeral: true });
+
+        balance.sub(uid, finalTotal);
+        for (const u of resolved) {
+          balance.add(u.id, amt);
+          txLog("tip", { from: uid, to: u.id, amount: amt });
+          try { await u.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n💰 Balance: **${balance.get(u.id)} sats**`); } catch {}
+        }
+
+        const mentions = resolved.map(u => `<@${u.id}>`).join(", ");
+        let reply = `⚡ <@${uid}> ➡️ ${mentions} **${amt} sats** each! (Total: **${finalTotal} sats**)`;
         if (msg) reply += `\n💬 ${msg}`;
         await i.reply({ content: reply });
-
-        try { await target.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n💰 Balance: **${balance.get(target.id)} sats**`); } catch {}
         return;
       }
 
