@@ -229,12 +229,28 @@ const decodeInvoiceAmount = (invoice) => {
   } catch { return null; }
 };
 
+const validateUrl = (urlStr) => {
+  const parsed = new URL(urlStr);
+  if (parsed.protocol !== "https:") throw new Error("HTTPS only");
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0" || hostname === "::1") throw new Error("Blocked host");
+  if (hostname.endsWith(".local")) throw new Error("Blocked domain");
+  const parts = hostname.split(".").map(Number);
+  if (parts[0] === 10) throw new Error("Blocked IP");
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) throw new Error("Blocked IP");
+  if (parts[0] === 192 && parts[1] === 168) throw new Error("Blocked IP");
+  if (parts[0] === 169 && parts[1] === 254) throw new Error("Blocked IP");
+  return urlStr;
+};
+
 const getLnurlInvoice = async (addr, sats) => {
   const [user, domain] = addr.split("@");
   if (!user || !domain) throw new Error("Invalid address");
-  const { data: lnurl } = await axios.get(`https://${domain}/.well-known/lnurlp/${user}`, { timeout: 10000 });
+  const wellKnownUrl = validateUrl(`https://${domain}/.well-known/lnurlp/${user}`);
+  const { data: lnurl } = await axios.get(wellKnownUrl, { timeout: 10000, maxRedirects: 3, beforeRedirect: (opts) => validateUrl(opts.href) });
   if (lnurl.status === "ERROR") throw new Error(lnurl.reason);
-  const { data: inv } = await axios.get(lnurl.callback, { params: { amount: sats * 1000 }, timeout: 10000 });
+  const callbackUrl = validateUrl(lnurl.callback);
+  const { data: inv } = await axios.get(callbackUrl, { params: { amount: sats * 1000 }, timeout: 10000, maxRedirects: 3, beforeRedirect: (opts) => validateUrl(opts.href) });
   if (inv.status === "ERROR") throw new Error(inv.reason);
   return inv.pr;
 };
