@@ -1,6 +1,6 @@
 /**
- * CitadelPay v16 - Discord Lightning Payment Bot
- * 
+ * CitadelPay v17 - Discord Lightning Payment Bot (SQLite)
+ *
  * Features:
  * - Deposit/Withdraw via Lightning
  * - Tip users with sats
@@ -8,13 +8,16 @@
  * - Emoji reactions for tipping
  * - Multi-language support (EN/KO/JA/ES)
  * - Smart fees (Blink internal = free)
+ * - SQLite storage (migrated from JSON)
  */
 
 require("dotenv").config();
 const fs = require("fs");
+const path = require("path");
 const axios = require("axios");
 const qrcode = require("qrcode");
 const bolt11 = require("light-bolt11-decoder");
+const Database = require("better-sqlite3");
 
 const {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
@@ -65,6 +68,155 @@ const validateConfig = () => {
   }
 };
 validateConfig();
+
+// ============ SQLite Database ============
+const dbPath = path.join(__dirname, "citadelpay.db");
+const db = new Database(dbPath);
+
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS balances (
+    user_id TEXT PRIMARY KEY,
+    amount INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS redpackets (
+    msg_id TEXT PRIMARY KEY,
+    creator_id TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    per INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expired INTEGER NOT NULL DEFAULT 0,
+    memo TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS redpacket_claims (
+    msg_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (msg_id, user_id),
+    FOREIGN KEY (msg_id) REFERENCES redpackets(msg_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL DEFAULT (datetime('now')),
+    type TEXT NOT NULL,
+    from_uid TEXT,
+    to_uid TEXT,
+    amount INTEGER,
+    fee INTEGER,
+    balance_after INTEGER,
+    details TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_tx_from ON transactions(from_uid);
+  CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_uid);
+  CREATE INDEX IF NOT EXISTS idx_tx_type ON transactions(type);
+  CREATE INDEX IF NOT EXISTS idx_tx_ts ON transactions(ts);
+`);
+
+// ============ Migrate from JSON ============
+const migrateFromJson = () => {
+  const balanceFile = path.join(__dirname, "citadelpay_balances.json");
+  if (!fs.existsSync(balanceFile)) return;
+
+  const existing = db.prepare("SELECT COUNT(*) as cnt FROM balances").get();
+  if (existing.cnt > 0) return;
+
+  console.log("📦 Migrating JSON → SQLite...");
+
+  const data = JSON.parse(fs.readFileSync(balanceFile, "utf8"));
+  const insert = db.prepare("INSERT OR IGNORE INTO balances (user_id, amount) VALUES (?, ?)");
+
+  const migrate = db.transaction(() => {
+    let count = 0;
+    for (const [uid, amt] of Object.entries(data)) {
+      insert.run(uid, amt);
+      count++;
+    }
+    console.log(`✅ Migrated ${count} balances`);
+  });
+  migrate();
+
+  const rpFile = path.join(__dirname, "citadelpay_redpackets.json");
+  if (fs.existsSync(rpFile)) {
+    try {
+      const rpData = JSON.parse(fs.readFileSync(rpFile, "utf8"));
+      const insertRp = db.prepare("INSERT OR IGNORE INTO redpackets (msg_id, creator_id, amount, count, per, channel_id, created_at, expired, memo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      const insertClaim = db.prepare("INSERT OR IGNORE INTO redpacket_claims (msg_id, user_id) VALUES (?, ?)");
+
+      db.transaction(() => {
+        for (const [msgId, pkt] of Object.entries(rpData)) {
+          if (!pkt.creatorId) continue;
+          insertRp.run(msgId, pkt.creatorId, pkt.amount, pkt.count, pkt.per, pkt.channelId || "", pkt.createdAt || 0, pkt.expired ? 1 : 0, pkt.memo || null);
+          if (pkt.claimedBy) {
+            for (const uid of pkt.claimedBy) {
+              insertClaim.run(msgId, uid);
+            }
+          }
+        }
+      })();
+      console.log("✅ Migrated redpackets");
+    } catch (e) {
+      console.error("⚠️ Redpacket migration skipped:", e.message);
+    }
+  }
+
+  fs.renameSync(balanceFile, balanceFile + ".bak");
+  if (fs.existsSync(rpFile)) fs.renameSync(rpFile, rpFile + ".bak");
+  console.log("📦 Old JSON files renamed to .bak");
+};
+migrateFromJson();
+
+// ============ DB Helpers (Prepared Statements) ============
+const stmt = {
+  getBalance: db.prepare("SELECT amount FROM balances WHERE user_id = ?"),
+  upsertBalance: db.prepare("INSERT INTO balances (user_id, amount) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET amount = ?"),
+  insertTx: db.prepare("INSERT INTO transactions (type, from_uid, to_uid, amount, fee, balance_after, details) VALUES (?, ?, ?, ?, ?, ?, ?)"),
+  getRedpacket: db.prepare("SELECT * FROM redpackets WHERE msg_id = ?"),
+  insertRedpacket: db.prepare("INSERT INTO redpackets (msg_id, creator_id, amount, count, per, channel_id, created_at, expired, memo) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)"),
+  expireRedpacket: db.prepare("UPDATE redpackets SET expired = 1 WHERE msg_id = ?"),
+  getRedpacketClaims: db.prepare("SELECT user_id FROM redpacket_claims WHERE msg_id = ?"),
+  insertClaim: db.prepare("INSERT OR IGNORE INTO redpacket_claims (msg_id, user_id) VALUES (?, ?)"),
+  getActiveRedpackets: db.prepare("SELECT * FROM redpackets WHERE expired = 0"),
+};
+
+// ============ Balance Operations ============
+const balance = {
+  get: (uid) => stmt.getBalance.get(uid)?.amount || 0,
+  set: (uid, amt) => stmt.upsertBalance.run(uid, amt, amt),
+  add: (uid, amt) => {
+    const cur = balance.get(uid);
+    balance.set(uid, cur + amt);
+  },
+  sub: (uid, amt) => {
+    const cur = balance.get(uid);
+    balance.set(uid, Math.max(0, cur - amt));
+  }
+};
+
+const OWNER_ID = "owner";
+const owner = {
+  get: () => balance.get(OWNER_ID),
+  add: (amt) => amt > 0 && balance.add(OWNER_ID, amt),
+  reset: () => balance.set(OWNER_ID, 0)
+};
+
+// ============ Transaction Log ============
+const txLog = (type, { from, to, uid, amount, fee, dest, status, reason, emoji, bal }) => {
+  const fromUid = from || uid || null;
+  const toUid = to || null;
+  const balAfter = bal ?? null;
+  const details = JSON.stringify(
+    Object.fromEntries(Object.entries({ dest, status, reason, emoji }).filter(([, v]) => v != null))
+  );
+  stmt.insertTx.run(type, fromUid, toUid, amount || null, fee || null, balAfter, details === "{}" ? null : details);
+};
 
 // ============ Blink API ============
 const blinkApi = axios.create({
@@ -179,43 +331,6 @@ const blink = {
   }
 };
 
-// ============ Storage ============
-class JsonStore {
-  constructor(file) {
-    this.file = file;
-    this.data = {};
-    try { this.data = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
-  }
-  save() { fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2)); }
-  get(k) { return this.data[k]; }
-  set(k, v) { this.data[k] = v; this.save(); }
-  del(k) { delete this.data[k]; this.save(); }
-  all() { return this.data; }
-}
-
-const balanceStore = new JsonStore("./citadelpay_balances.json");
-const redpacketStore = new JsonStore("./citadelpay_redpackets.json");
-
-const balance = {
-  get: (uid) => balanceStore.get(uid) || 0,
-  set: (uid, amt) => balanceStore.set(uid, amt),
-  add: (uid, amt) => balanceStore.set(uid, balance.get(uid) + amt),
-  sub: (uid, amt) => balanceStore.set(uid, Math.max(0, balance.get(uid) - amt))
-};
-
-const OWNER_ID = "owner";
-const owner = {
-  get: () => balance.get(OWNER_ID),
-  add: (amt) => amt > 0 && balance.add(OWNER_ID, amt),
-  reset: () => balance.set(OWNER_ID, 0)
-};
-
-// ============ Transaction Log ============
-const txLog = (type, data) => {
-  const entry = JSON.stringify({ ts: new Date().toISOString(), type, ...data });
-  fs.appendFileSync("./citadelpay_tx.log", entry + "\n");
-};
-
 // ============ Utils ============
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -279,22 +394,28 @@ const client = new Client({
 });
 
 // ============ Redpacket ============
+const getRedpacketData = (msgId) => {
+  const pkt = stmt.getRedpacket.get(msgId);
+  if (!pkt) return null;
+  const claims = stmt.getRedpacketClaims.all(msgId).map(r => r.user_id);
+  return { ...pkt, claimedBy: claims };
+};
+
 const expireRedpacket = async (msgId, channelId) => {
-  const pkt = redpacketStore.get(msgId);
+  const pkt = getRedpacketData(msgId);
   if (!pkt || pkt.expired) return;
 
-  pkt.expired = true;
-  redpacketStore.set(msgId, pkt);
+  stmt.expireRedpacket.run(msgId);
 
-  const claimed = pkt.claimedBy?.length || 0;
+  const claimed = pkt.claimedBy.length;
   const refund = (pkt.count - claimed) * pkt.per;
 
   if (refund > 0) {
-    balance.add(pkt.creatorId, refund);
-    txLog("redpacket_refund", { uid: pkt.creatorId, amount: refund, bal: balance.get(pkt.creatorId) });
+    balance.add(pkt.creator_id, refund);
+    txLog("redpacket_refund", { uid: pkt.creator_id, amount: refund, bal: balance.get(pkt.creator_id) });
     try {
-      const user = await client.users.fetch(pkt.creatorId);
-      await user.send(`🎁 **Expired!**\n👥 ${claimed}/${pkt.count}\n💸 Refund: **${refund} sats**\n💰 Balance: **${balance.get(pkt.creatorId)} sats**`);
+      const user = await client.users.fetch(pkt.creator_id);
+      await user.send(`🎁 **Expired!**\n👥 ${claimed}/${pkt.count}\n💸 Refund: **${refund} sats**\n💰 Balance: **${balance.get(pkt.creator_id)} sats**`);
     } catch {}
   }
 
@@ -312,16 +433,18 @@ const expireRedpacket = async (msgId, channelId) => {
 
 const restoreTimers = () => {
   const now = Date.now();
-  for (const [id, pkt] of Object.entries(redpacketStore.all())) {
-    if (pkt.expired || !pkt.createdAt || !pkt.channelId) continue;
-    if ((pkt.claimedBy?.length || 0) >= pkt.count) continue;
+  const active = stmt.getActiveRedpackets.all();
 
-    const remaining = config.limits.redpacketExpiry - (now - pkt.createdAt);
+  for (const pkt of active) {
+    const claims = stmt.getRedpacketClaims.all(pkt.msg_id);
+    if (claims.length >= pkt.count) continue;
+
+    const remaining = config.limits.redpacketExpiry - (now - pkt.created_at);
     if (remaining <= 0) {
-      expireRedpacket(id, pkt.channelId);
+      expireRedpacket(pkt.msg_id, pkt.channel_id);
     } else {
-      setTimeout(() => expireRedpacket(id, pkt.channelId), remaining);
-      console.log(`🔄 Timer: ${id} (${Math.round(remaining/1000)}s)`);
+      setTimeout(() => expireRedpacket(pkt.msg_id, pkt.channel_id), remaining);
+      console.log(`🔄 Timer: ${pkt.msg_id} (${Math.round(remaining/1000)}s)`);
     }
   }
 };
@@ -409,21 +532,20 @@ client.on("interactionCreate", async (i) => {
     // Buttons
     if (i.isButton()) {
       if (i.customId === "redpacket_claim") {
-        const pkt = redpacketStore.get(i.message.id);
+        const pkt = getRedpacketData(i.message.id);
         if (!pkt) return i.reply({ content: "❌ Invalid", ephemeral: true });
         if (pkt.expired) return i.reply({ content: "❌ Expired", ephemeral: true });
-        if (pkt.creatorId === i.user.id) return i.reply({ content: "❌ Own packet", ephemeral: true });
-        if (pkt.claimedBy?.includes(i.user.id)) return i.reply({ content: "❌ Already claimed", ephemeral: true });
-        if ((pkt.claimedBy?.length || 0) >= pkt.count) return i.reply({ content: "❌ All claimed", ephemeral: true });
+        if (pkt.creator_id === i.user.id) return i.reply({ content: "❌ Own packet", ephemeral: true });
+        if (pkt.claimedBy.includes(i.user.id)) return i.reply({ content: "❌ Already claimed", ephemeral: true });
+        if (pkt.claimedBy.length >= pkt.count) return i.reply({ content: "❌ All claimed", ephemeral: true });
 
         balance.add(i.user.id, pkt.per);
-        txLog("redpacket_claim", { uid: i.user.id, amount: pkt.per, from: pkt.creatorId, bal: balance.get(i.user.id) });
-        pkt.claimedBy = [...(pkt.claimedBy || []), i.user.id];
-        redpacketStore.set(i.message.id, pkt);
+        stmt.insertClaim.run(i.message.id, i.user.id);
+        txLog("redpacket_claim", { uid: i.user.id, amount: pkt.per, from: pkt.creator_id, bal: balance.get(i.user.id) });
 
         await i.reply({ content: `🎉 <@${i.user.id}> +**${pkt.per} sats**!` });
 
-        if (pkt.claimedBy.length >= pkt.count) {
+        if (pkt.claimedBy.length + 1 >= pkt.count) {
           const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("done").setLabel("✅ Done").setStyle(ButtonStyle.Secondary).setDisabled(true)
           );
@@ -470,7 +592,6 @@ client.on("interactionCreate", async (i) => {
 
           if (balance.get(i.user.id) < total) return i.editReply(`❌ Balance: ${balance.get(i.user.id)} (Need: ${total})`);
 
-          // 잔액 먼저 차감 (이중지불 방지)
           balance.sub(i.user.id, total);
           if (fee > 0) owner.add(fee);
           txLog("withdraw", { uid: i.user.id, amount: amt, fee, dest: addr, status: "pending" });
@@ -521,7 +642,6 @@ client.on("interactionCreate", async (i) => {
 
           if (balance.get(i.user.id) < total) return i.editReply(`❌ Balance: ${balance.get(i.user.id)} (Need: ${total})`);
 
-          // 잔액 먼저 차감 (이중지불 방지)
           balance.sub(i.user.id, total);
           if (fee > 0) owner.add(fee);
           txLog("withdraw", { uid: i.user.id, amount: amt, fee, dest: "invoice", status: "pending" });
@@ -590,18 +710,15 @@ client.on("interactionCreate", async (i) => {
 
         if (amt <= 0) return i.reply({ content: "❌ Amount > 0", ephemeral: true });
 
-        // 멘션에서 유저 ID 추출
         const userIds = [...new Set(usersInput.match(/<@!?(\d+)>/g)?.map(m => m.replace(/<@!?|>/g, "")) || [])];
         if (!userIds.length) return i.reply({ content: "❌ @멘션으로 유저를 지정하세요", ephemeral: true });
 
-        // 자기 자신 제외
         const targets = userIds.filter(id => id !== uid);
         if (!targets.length) return i.reply({ content: "❌ 자신에게는 팁을 보낼 수 없습니다", ephemeral: true });
 
         const total = amt * targets.length;
         if (balance.get(uid) < total) return i.reply({ content: `❌ Balance: ${balance.get(uid)} sats (Need: ${total})`, ephemeral: true });
 
-        // 봇 체크
         const resolved = [];
         for (const id of targets) {
           try {
@@ -651,7 +768,7 @@ client.on("interactionCreate", async (i) => {
         if (balance.get(uid) < total) return i.reply({ content: `❌ Balance: ${balance.get(uid)} (Need: ${total})`, ephemeral: true });
 
         balance.sub(uid, total);
-        txLog("redpacket_create", { uid, amount: total, per, count });
+        txLog("redpacket_create", { uid, amount: total });
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId("redpacket_claim").setLabel("🎁 CLAIM").setStyle(ButtonStyle.Primary)
@@ -662,11 +779,7 @@ client.on("interactionCreate", async (i) => {
 
         const msg = await i.reply({ content, components: [row], fetchReply: true });
 
-        redpacketStore.set(msg.id, {
-          creatorId: uid, amount: total, count, per,
-          claimedBy: [], channelId: i.channelId,
-          createdAt: Date.now(), expired: false, memo
-        });
+        stmt.insertRedpacket.run(msg.id, uid, total, count, per, i.channelId, Date.now(), memo || null);
 
         setTimeout(() => expireRedpacket(msg.id, i.channelId), config.limits.redpacketExpiry);
         return;
@@ -701,12 +814,21 @@ client.on("interactionCreate", async (i) => {
   }
 });
 
+// ============ Graceful Shutdown ============
+const shutdown = () => {
+  console.log("🔄 Shutting down...");
+  db.close();
+  process.exit(0);
+};
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
 // ============ Start ============
 client.once("ready", async () => {
   console.log(`🤖 ${client.user.tag}`);
   await registerCommands();
   restoreTimers();
-  console.log("✅ Ready");
+  console.log("✅ Ready (SQLite)");
 });
 
 client.login(config.discord.token);
