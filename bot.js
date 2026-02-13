@@ -173,6 +173,37 @@ const migrateFromJson = () => {
 };
 migrateFromJson();
 
+// ============ Rate Limiter ============
+class RateLimiter {
+  constructor(maxRequests, windowMs) {
+    this.limits = new Map();
+    this.maxRequests = maxRequests;
+    this.windowMs = windowMs;
+  }
+
+  check(userId) {
+    const now = Date.now();
+    const userLimits = this.limits.get(userId) || [];
+    const validRequests = userLimits.filter(ts => now - ts < this.windowMs);
+    
+    if (validRequests.length >= this.maxRequests) {
+      const resetIn = Math.ceil((validRequests[0] + this.windowMs - now) / 1000);
+      return { allowed: false, resetIn };
+    }
+    
+    validRequests.push(now);
+    this.limits.set(userId, validRequests);
+    return { allowed: true };
+  }
+}
+
+// Rate limiters for each command (500 users scale)
+const depositLimiter = new RateLimiter(5, 60000);    // 5 per minute
+const withdrawLimiter = new RateLimiter(3, 60000);   // 3 per minute
+const tipLimiter = new RateLimiter(10, 60000);       // 10 per minute
+const redpacketLimiter = new RateLimiter(3, 60000);  // 3 per minute
+const emojiTipLimiter = new RateLimiter(20, 60000);  // 20 per minute
+
 // ============ DB Helpers (Prepared Statements) ============
 const stmt = {
   getBalance: db.prepare("SELECT amount FROM balances WHERE user_id = ?"),
@@ -186,18 +217,38 @@ const stmt = {
   getActiveRedpackets: db.prepare("SELECT * FROM redpackets WHERE expired = 0"),
 };
 
-// ============ Balance Operations ============
+// ============ Balance Operations (Atomic) ============
 const balance = {
   get: (uid) => stmt.getBalance.get(uid)?.amount || 0,
   set: (uid, amt) => stmt.upsertBalance.run(uid, amt, amt),
-  add: (uid, amt) => {
-    const cur = balance.get(uid);
-    balance.set(uid, cur + amt);
-  },
-  sub: (uid, amt) => {
-    const cur = balance.get(uid);
-    balance.set(uid, Math.max(0, cur - amt));
-  }
+  
+  add: db.transaction((uid, amt) => {
+    const cur = stmt.getBalance.get(uid)?.amount || 0;
+    const newVal = cur + amt;
+    stmt.upsertBalance.run(uid, newVal, newVal);
+    return newVal;
+  }),
+  
+  sub: db.transaction((uid, amt) => {
+    const cur = stmt.getBalance.get(uid)?.amount || 0;
+    if (cur < amt) {
+      throw new Error(`Insufficient balance: ${cur} < ${amt}`);
+    }
+    const newVal = cur - amt;
+    stmt.upsertBalance.run(uid, newVal, newVal);
+    return newVal;
+  }),
+  
+  transfer: db.transaction((fromUid, toUid, amt) => {
+    const fromBal = stmt.getBalance.get(fromUid)?.amount || 0;
+    if (fromBal < amt) {
+      throw new Error(`Insufficient balance: ${fromBal} < ${amt}`);
+    }
+    const toBal = stmt.getBalance.get(toUid)?.amount || 0;
+    stmt.upsertBalance.run(fromUid, fromBal - amt, fromBal - amt);
+    stmt.upsertBalance.run(toUid, toBal + amt, toBal + amt);
+    return { fromBalance: fromBal - amt, toBalance: toBal + amt };
+  })
 };
 
 const OWNER_ID = "owner";
@@ -501,6 +552,14 @@ client.on("messageReactionAdd", async (reaction, user) => {
     const amount = config.emojiTips[reaction.emoji.name];
     if (!amount) return;
 
+    const emojiCheck = emojiTipLimiter.check(user.id);
+    if (!emojiCheck.allowed) {
+      try {
+        await user.send(`⏰ 이모지 팁 제한: ${emojiCheck.resetIn}초 후 다시 시도하세요.`);
+      } catch {}
+      return;
+    }
+
     const author = reaction.message.author;
     if (author.id === user.id || author.bot) return;
 
@@ -688,6 +747,11 @@ client.on("interactionCreate", async (i) => {
         return i.reply({ content: `💰 Balance: **${balance.get(uid)} sats**`, ephemeral: true });
 
       case "deposit": {
+        const depositCheck = depositLimiter.check(uid);
+        if (!depositCheck.allowed) {
+          return i.reply({ content: `⏰ 너무 많은 요청입니다. ${depositCheck.resetIn}초 후 다시 시도하세요.`, ephemeral: true });
+        }
+
         const amt = i.options.getInteger("amount");
         if (amt <= 0) return i.reply({ content: "❌ Amount > 0", ephemeral: true });
 
@@ -704,6 +768,11 @@ client.on("interactionCreate", async (i) => {
       }
 
       case "tip": {
+        const tipCheck = tipLimiter.check(uid);
+        if (!tipCheck.allowed) {
+          return i.reply({ content: `⏰ 너무 많은 요청입니다. ${tipCheck.resetIn}초 후 다시 시도하세요.`, ephemeral: true });
+        }
+
         const usersInput = i.options.getString("users");
         const amt = i.options.getInteger("amount");
         const msg = i.options.getString("message");
@@ -747,6 +816,11 @@ client.on("interactionCreate", async (i) => {
       }
 
       case "withdraw": {
+        const withdrawCheck = withdrawLimiter.check(uid);
+        if (!withdrawCheck.allowed) {
+          return i.reply({ content: `⏰ 너무 많은 요청입니다. ${withdrawCheck.resetIn}초 후 다시 시도하세요.`, ephemeral: true });
+        }
+
         const embed = new EmbedBuilder().setColor(0xF7931A).setTitle("💰 Withdraw")
           .setDescription(`⚡ **Lightning Address**: user@wallet.com\n🧾 **Invoice/LNURL**: lnbc...\n\n💸 Fee: Blink=Free, Other=${config.fees.external} sats\n📊 Max: ${config.limits.maxWithdraw} sats`);
         const row = new ActionRowBuilder().addComponents(
@@ -757,6 +831,11 @@ client.on("interactionCreate", async (i) => {
       }
 
       case "redpacket": {
+        const redpacketCheck = redpacketLimiter.check(uid);
+        if (!redpacketCheck.allowed) {
+          return i.reply({ content: `⏰ 너무 많은 요청입니다. ${redpacketCheck.resetIn}초 후 다시 시도하세요.`, ephemeral: true });
+        }
+
         const per = i.options.getInteger("amount");
         const count = i.options.getInteger("count");
         const memo = i.options.getString("memo");
