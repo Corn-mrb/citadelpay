@@ -37,6 +37,9 @@ const config = {
     apiKey: process.env.BLINK_API_KEY,
     endpoint: process.env.BLINK_API_ENDPOINT || "https://api.blink.sv/graphql"
   },
+  redpacketChannels: process.env.REDPACKET_CHANNEL_IDS
+    ? process.env.REDPACKET_CHANNEL_IDS.split(",").map(s => s.trim()).filter(Boolean)
+    : [],
   limits: {
     maxWithdraw: 30000,
     maxRedpacketCount: 100,
@@ -831,6 +834,9 @@ client.on("interactionCreate", async (i) => {
       }
 
       case "redpacket": {
+        if (config.redpacketChannels.length > 0 && !config.redpacketChannels.includes(i.channelId)) {
+          return i.reply({ content: "❌ 이 채널에서는 레드패킷을 사용할 수 없습니다.", ephemeral: true });
+        }
         const redpacketCheck = redpacketLimiter.check(uid);
         if (!redpacketCheck.allowed) {
           return i.reply({ content: `⏰ 너무 많은 요청입니다. ${redpacketCheck.resetIn}초 후 다시 시도하세요.`, ephemeral: true });
