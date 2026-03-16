@@ -121,6 +121,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_uid);
   CREATE INDEX IF NOT EXISTS idx_tx_type ON transactions(type);
   CREATE INDEX IF NOT EXISTS idx_tx_ts ON transactions(ts);
+
+  CREATE TABLE IF NOT EXISTS pending_invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    payment_request TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 // ============ Migrate from JSON ============
@@ -212,6 +220,9 @@ const stmt = {
   getBalance: db.prepare("SELECT amount FROM balances WHERE user_id = ?"),
   upsertBalance: db.prepare("INSERT INTO balances (user_id, amount) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET amount = ?"),
   insertTx: db.prepare("INSERT INTO transactions (type, from_uid, to_uid, amount, fee, balance_after, details) VALUES (?, ?, ?, ?, ?, ?, ?)"),
+  insertPendingInvoice: db.prepare("INSERT INTO pending_invoices (user_id, payment_request, amount, created_at) VALUES (?, ?, ?, ?)"),
+  deletePendingInvoice: db.prepare("DELETE FROM pending_invoices WHERE payment_request = ?"),
+  getAllPendingInvoices: db.prepare("SELECT * FROM pending_invoices"),
   getRedpacket: db.prepare("SELECT * FROM redpackets WHERE msg_id = ?"),
   insertRedpacket: db.prepare("INSERT INTO redpackets (msg_id, creator_id, amount, count, per, channel_id, created_at, expired, memo) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)"),
   expireRedpacket: db.prepare("UPDATE redpackets SET expired = 1 WHERE msg_id = ?"),
@@ -424,20 +435,41 @@ const getLnurlInvoice = async (addr, sats) => {
   return inv.pr;
 };
 
-const watchInvoice = async (pr, uid, amount) => {
+const watchInvoice = async (pr, uid, amount, createdAt = Date.now()) => {
+  const elapsed = Date.now() - createdAt;
+  const remaining = config.limits.invoiceExpiry - elapsed;
+  if (remaining <= 0) {
+    stmt.deletePendingInvoice.run(pr);
+    return;
+  }
   const start = Date.now();
-  while (Date.now() - start < config.limits.invoiceExpiry) {
+  while (Date.now() - start < remaining) {
     try {
       const status = await blink.checkInvoice(pr);
       if (status === "PAID") {
         balance.add(uid, amount);
         txLog("deposit", { uid, amount, bal: balance.get(uid) });
+        stmt.deletePendingInvoice.run(pr);
         console.log(`✅ +${amount} sats → ${uid}`);
         return;
       }
-      if (status === "EXPIRED" || status === "CANCELLED") return;
+      if (status === "EXPIRED" || status === "CANCELLED") {
+        stmt.deletePendingInvoice.run(pr);
+        return;
+      }
     } catch (e) { console.error("Poll error:", e.message); }
     await sleep(config.limits.pollInterval);
+  }
+  stmt.deletePendingInvoice.run(pr);
+};
+
+const restorePendingInvoices = () => {
+  const pending = stmt.getAllPendingInvoices.all();
+  if (!pending.length) return;
+  console.log(`🔄 Restoring ${pending.length} pending invoice(s)...`);
+  for (const row of pending) {
+    watchInvoice(row.payment_request, row.user_id, row.amount, row.created_at).catch(console.error);
+    console.log(`🔄 Invoice restored: ${row.user_id} ${row.amount} sats`);
   }
 };
 
@@ -762,7 +794,9 @@ client.on("interactionCreate", async (i) => {
         try {
           const pr = await blink.createInvoice(amt, `CitadelPay-${uid}`);
           const qr = await qrcode.toBuffer(pr);
-          watchInvoice(pr, uid, amt).catch(console.error);
+          const now = Date.now();
+          stmt.insertPendingInvoice.run(uid, pr, amt, now);
+          watchInvoice(pr, uid, amt, now).catch(console.error);
 
           await i.editReply({ content: `🧾 **Deposit**\n💰 **${amt} sats**\n📱 Scan or copy:`, files: [new AttachmentBuilder(qr, { name: "qr.png" })] });
           await i.followUp({ content: pr, ephemeral: true });
@@ -913,6 +947,7 @@ client.once("ready", async () => {
   console.log(`🤖 ${client.user.tag}`);
   await registerCommands();
   restoreTimers();
+  restorePendingInvoices();
   console.log("✅ Ready (SQLite)");
 });
 
