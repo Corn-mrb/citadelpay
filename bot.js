@@ -822,8 +822,8 @@ client.on("interactionCreate", async (i) => {
         const targets = userIds.filter(id => id !== uid);
         if (!targets.length) return i.reply({ content: "❌ 자신에게는 팁을 보낼 수 없습니다", ephemeral: true });
 
-        const total = amt * targets.length;
-        if (balance.get(uid) < total) return i.reply({ content: `❌ Balance: ${balance.get(uid)} sats (Need: ${total})`, ephemeral: true });
+        // users.fetch 루프 전에 defer → 인터랙션 토큰 15분으로 연장
+        await i.deferReply();
 
         const resolved = [];
         for (const id of targets) {
@@ -833,10 +833,10 @@ client.on("interactionCreate", async (i) => {
             resolved.push(u);
           } catch {}
         }
-        if (!resolved.length) return i.reply({ content: "❌ 유효한 유저가 없습니다", ephemeral: true });
+        if (!resolved.length) return i.editReply("❌ 유효한 유저가 없습니다");
 
         const finalTotal = amt * resolved.length;
-        if (balance.get(uid) < finalTotal) return i.reply({ content: `❌ Balance: ${balance.get(uid)} sats (Need: ${finalTotal})`, ephemeral: true });
+        if (balance.get(uid) < finalTotal) return i.editReply(`❌ Balance: ${balance.get(uid)} sats (Need: ${finalTotal})`);
 
         balance.sub(uid, finalTotal);
         for (const u of resolved) {
@@ -848,7 +848,7 @@ client.on("interactionCreate", async (i) => {
         const mentions = resolved.map(u => `<@${u.id}>`).join(", ");
         let reply = `⚡ <@${uid}> ➡️ ${mentions} **${amt} sats** each! (Total: **${finalTotal} sats**)`;
         if (msg) reply += `\n💬 ${msg}`;
-        await i.reply({ content: reply });
+        await i.editReply({ content: reply });
         return;
       }
 
