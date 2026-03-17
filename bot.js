@@ -262,6 +262,20 @@ const balance = {
     stmt.upsertBalance.run(fromUid, fromBal - amt, fromBal - amt);
     stmt.upsertBalance.run(toUid, toBal + amt, toBal + amt);
     return { fromBalance: fromBal - amt, toBalance: toBal + amt };
+  }),
+
+  multiTransfer: db.transaction((fromUid, toUids, amt) => {
+    const total = amt * toUids.length;
+    const fromBal = stmt.getBalance.get(fromUid)?.amount || 0;
+    if (fromBal < total) {
+      throw new Error(`Insufficient balance: ${fromBal} < ${total}`);
+    }
+    stmt.upsertBalance.run(fromUid, fromBal - total, fromBal - total);
+    for (const toUid of toUids) {
+      const toBal = stmt.getBalance.get(toUid)?.amount || 0;
+      stmt.upsertBalance.run(toUid, toBal + amt, toBal + amt);
+    }
+    return fromBal - total;
   })
 };
 
@@ -606,8 +620,7 @@ client.on("messageReactionAdd", async (reaction, user) => {
       return;
     }
 
-    balance.sub(user.id, amount);
-    balance.add(author.id, amount);
+    balance.transfer(user.id, author.id, amount);
     txLog("emoji_tip", { from: user.id, to: author.id, amount, emoji: reaction.emoji.name });
 
     await reaction.message.channel.send(`⚡ <@${user.id}> ➡️ <@${author.id}> **${amount} sats** tip!`);
@@ -838,9 +851,8 @@ client.on("interactionCreate", async (i) => {
         const finalTotal = amt * resolved.length;
         if (balance.get(uid) < finalTotal) return i.editReply(`❌ Balance: ${balance.get(uid)} sats (Need: ${finalTotal})`);
 
-        balance.sub(uid, finalTotal);
+        balance.multiTransfer(uid, resolved.map(u => u.id), amt);
         for (const u of resolved) {
-          balance.add(u.id, amt);
           txLog("tip", { from: uid, to: u.id, amount: amt });
           try { await u.send(`💰 <@${uid}> ➡️ You **${amt} sats**\n📍 <#${i.channelId}>\n💰 Balance: **${balance.get(u.id)} sats**`); } catch {}
         }
