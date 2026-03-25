@@ -4,7 +4,6 @@
  * Features:
  * - Deposit/Withdraw via Lightning
  * - Tip users with sats
- * - Redpacket with 60min expiry
  * - Emoji reactions for tipping
  * - Multi-language support (EN/KO/JA/ES)
  * - Smart fees (Blink internal = free)
@@ -37,13 +36,8 @@ const config = {
     apiKey: process.env.BLINK_API_KEY,
     endpoint: process.env.BLINK_API_ENDPOINT || "https://api.blink.sv/graphql"
   },
-  redpacketChannels: process.env.REDPACKET_CHANNEL_IDS
-    ? process.env.REDPACKET_CHANNEL_IDS.split(",").map(s => s.trim()).filter(Boolean)
-    : [],
   limits: {
     maxWithdraw: 30000,
-    maxRedpacketCount: 100,
-    redpacketExpiry: 60 * 60 * 1000, // 60 min
     invoiceExpiry: 60 * 60 * 1000,   // 60 min
     pollInterval: 5000               // 5 sec
   },
@@ -83,26 +77,6 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS balances (
     user_id TEXT PRIMARY KEY,
     amount INTEGER NOT NULL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS redpackets (
-    msg_id TEXT PRIMARY KEY,
-    creator_id TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    count INTEGER NOT NULL,
-    per INTEGER NOT NULL,
-    channel_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    expired INTEGER NOT NULL DEFAULT 0,
-    memo TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS redpacket_claims (
-    msg_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (msg_id, user_id),
-    FOREIGN KEY (msg_id) REFERENCES redpackets(msg_id)
   );
 
   CREATE TABLE IF NOT EXISTS transactions (
@@ -154,32 +128,7 @@ const migrateFromJson = () => {
   });
   migrate();
 
-  const rpFile = path.join(__dirname, "citadelpay_redpackets.json");
-  if (fs.existsSync(rpFile)) {
-    try {
-      const rpData = JSON.parse(fs.readFileSync(rpFile, "utf8"));
-      const insertRp = db.prepare("INSERT OR IGNORE INTO redpackets (msg_id, creator_id, amount, count, per, channel_id, created_at, expired, memo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-      const insertClaim = db.prepare("INSERT OR IGNORE INTO redpacket_claims (msg_id, user_id) VALUES (?, ?)");
-
-      db.transaction(() => {
-        for (const [msgId, pkt] of Object.entries(rpData)) {
-          if (!pkt.creatorId) continue;
-          insertRp.run(msgId, pkt.creatorId, pkt.amount, pkt.count, pkt.per, pkt.channelId || "", pkt.createdAt || 0, pkt.expired ? 1 : 0, pkt.memo || null);
-          if (pkt.claimedBy) {
-            for (const uid of pkt.claimedBy) {
-              insertClaim.run(msgId, uid);
-            }
-          }
-        }
-      })();
-      console.log("✅ Migrated redpackets");
-    } catch (e) {
-      console.error("⚠️ Redpacket migration skipped:", e.message);
-    }
-  }
-
   fs.renameSync(balanceFile, balanceFile + ".bak");
-  if (fs.existsSync(rpFile)) fs.renameSync(rpFile, rpFile + ".bak");
   console.log("📦 Old JSON files renamed to .bak");
 };
 migrateFromJson();
@@ -212,7 +161,6 @@ class RateLimiter {
 const depositLimiter = new RateLimiter(5, 60000);    // 5 per minute
 const withdrawLimiter = new RateLimiter(3, 60000);   // 3 per minute
 const tipLimiter = new RateLimiter(10, 60000);       // 10 per minute
-const redpacketLimiter = new RateLimiter(3, 60000);  // 3 per minute
 const emojiTipLimiter = new RateLimiter(20, 60000);  // 20 per minute
 
 // ============ DB Helpers (Prepared Statements) ============
@@ -223,12 +171,6 @@ const stmt = {
   insertPendingInvoice: db.prepare("INSERT INTO pending_invoices (user_id, payment_request, amount, created_at) VALUES (?, ?, ?, ?)"),
   deletePendingInvoice: db.prepare("DELETE FROM pending_invoices WHERE payment_request = ?"),
   getAllPendingInvoices: db.prepare("SELECT * FROM pending_invoices"),
-  getRedpacket: db.prepare("SELECT * FROM redpackets WHERE msg_id = ?"),
-  insertRedpacket: db.prepare("INSERT INTO redpackets (msg_id, creator_id, amount, count, per, channel_id, created_at, expired, memo) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)"),
-  expireRedpacket: db.prepare("UPDATE redpackets SET expired = 1 WHERE msg_id = ?"),
-  getRedpacketClaims: db.prepare("SELECT user_id FROM redpacket_claims WHERE msg_id = ?"),
-  insertClaim: db.prepare("INSERT OR IGNORE INTO redpacket_claims (msg_id, user_id) VALUES (?, ?)"),
-  getActiveRedpackets: db.prepare("SELECT * FROM redpackets WHERE expired = 0"),
 };
 
 // ============ Balance Operations (Atomic) ============
@@ -493,62 +435,6 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction]
 });
 
-// ============ Redpacket ============
-const getRedpacketData = (msgId) => {
-  const pkt = stmt.getRedpacket.get(msgId);
-  if (!pkt) return null;
-  const claims = stmt.getRedpacketClaims.all(msgId).map(r => r.user_id);
-  return { ...pkt, claimedBy: claims };
-};
-
-const expireRedpacket = async (msgId, channelId) => {
-  const pkt = getRedpacketData(msgId);
-  if (!pkt || pkt.expired) return;
-
-  stmt.expireRedpacket.run(msgId);
-
-  const claimed = pkt.claimedBy.length;
-  const refund = (pkt.count - claimed) * pkt.per;
-
-  if (refund > 0) {
-    balance.add(pkt.creator_id, refund);
-    txLog("redpacket_refund", { uid: pkt.creator_id, amount: refund, bal: balance.get(pkt.creator_id) });
-    try {
-      const user = await client.users.fetch(pkt.creator_id);
-      await user.send(`🎁 **Expired!**\n👥 ${claimed}/${pkt.count}\n💸 Refund: **${refund} sats**\n💰 Balance: **${balance.get(pkt.creator_id)} sats**`);
-    } catch {}
-  }
-
-  try {
-    const ch = await client.channels.fetch(channelId);
-    const msg = await ch.messages.fetch(msgId);
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("expired").setLabel("⏰ Expired").setStyle(ButtonStyle.Secondary).setDisabled(true)
-    );
-    await msg.edit({ content: msg.content + "\n\n⏰ **Expired**", components: [row] });
-  } catch {}
-
-  console.log(`⏰ Redpacket ${msgId}: refund ${refund} sats`);
-};
-
-const restoreTimers = () => {
-  const now = Date.now();
-  const active = stmt.getActiveRedpackets.all();
-
-  for (const pkt of active) {
-    const claims = stmt.getRedpacketClaims.all(pkt.msg_id);
-    if (claims.length >= pkt.count) continue;
-
-    const remaining = config.limits.redpacketExpiry - (now - pkt.created_at);
-    if (remaining <= 0) {
-      expireRedpacket(pkt.msg_id, pkt.channel_id);
-    } else {
-      setTimeout(() => expireRedpacket(pkt.msg_id, pkt.channel_id), remaining);
-      console.log(`🔄 Timer: ${pkt.msg_id} (${Math.round(remaining/1000)}s)`);
-    }
-  }
-};
-
 // ============ Commands ============
 const commands = [
   new SlashCommandBuilder().setName("deposit").setDescription("Create deposit invoice")
@@ -566,12 +452,6 @@ const commands = [
 
   new SlashCommandBuilder().setName("withdraw").setDescription("Withdraw sats")
     .setDescriptionLocalizations({ ko: "출금", ja: "出金", "es-ES": "Retirar" }),
-
-  new SlashCommandBuilder().setName("redpacket").setDescription("Create redpacket")
-    .setDescriptionLocalizations({ ko: "레드패킷 생성", ja: "レッドパケット作成", "es-ES": "Crear paquete rojo" })
-    .addIntegerOption(o => o.setName("amount").setDescription("Per person (sats)").setDescriptionLocalizations({ ko: "1인당 (sats)", ja: "1人当たり (sats)", "es-ES": "Por persona (sats)" }).setRequired(true))
-    .addIntegerOption(o => o.setName("count").setDescription("Count").setDescriptionLocalizations({ ko: "인원", ja: "人数", "es-ES": "Cantidad" }).setRequired(true))
-    .addStringOption(o => o.setName("memo").setDescription("Memo").setDescriptionLocalizations({ ko: "메모", ja: "メモ", "es-ES": "Nota" }).setRequired(false)),
 
   new SlashCommandBuilder().setName("owner_balance").setDescription("Owner balance")
     .setDescriptionLocalizations({ ko: "운영자 잔액", ja: "オーナー残高", "es-ES": "Saldo del propietario" }),
@@ -638,29 +518,6 @@ client.on("interactionCreate", async (i) => {
   try {
     // Buttons
     if (i.isButton()) {
-      if (i.customId === "redpacket_claim") {
-        const pkt = getRedpacketData(i.message.id);
-        if (!pkt) return i.reply({ content: "❌ Invalid", ephemeral: true });
-        if (pkt.expired) return i.reply({ content: "❌ Expired", ephemeral: true });
-        if (pkt.creator_id === i.user.id) return i.reply({ content: "❌ Own packet", ephemeral: true });
-        if (pkt.claimedBy.includes(i.user.id)) return i.reply({ content: "❌ Already claimed", ephemeral: true });
-        if (pkt.claimedBy.length >= pkt.count) return i.reply({ content: "❌ All claimed", ephemeral: true });
-
-        balance.add(i.user.id, pkt.per);
-        stmt.insertClaim.run(i.message.id, i.user.id);
-        txLog("redpacket_claim", { uid: i.user.id, amount: pkt.per, from: pkt.creator_id, bal: balance.get(i.user.id) });
-
-        await i.reply({ content: `🎉 <@${i.user.id}> +**${pkt.per} sats**!` });
-
-        if (pkt.claimedBy.length + 1 >= pkt.count) {
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("done").setLabel("✅ Done").setStyle(ButtonStyle.Secondary).setDisabled(true)
-          );
-          await i.message.edit({ components: [row] });
-        }
-        return;
-      }
-
       if (i.customId === "withdraw_lightning_address") {
         const modal = new ModalBuilder().setCustomId("withdraw_addr").setTitle("⚡ Lightning Address");
         modal.addComponents(
@@ -879,43 +736,6 @@ client.on("interactionCreate", async (i) => {
         return i.reply({ embeds: [embed], components: [row], ephemeral: true });
       }
 
-      case "redpacket": {
-        if (config.redpacketChannels.length > 0 && !config.redpacketChannels.includes(i.channelId)) {
-          return i.reply({ content: "❌ 이 채널에서는 레드패킷을 사용할 수 없습니다.", ephemeral: true });
-        }
-        const redpacketCheck = redpacketLimiter.check(uid);
-        if (!redpacketCheck.allowed) {
-          return i.reply({ content: `⏰ 너무 많은 요청입니다. ${redpacketCheck.resetIn}초 후 다시 시도하세요.`, ephemeral: true });
-        }
-
-        const per = i.options.getInteger("amount");
-        const count = i.options.getInteger("count");
-        const memo = i.options.getString("memo");
-
-        if (per <= 0 || count <= 0) return i.reply({ content: "❌ Amount & count > 0", ephemeral: true });
-        if (count > config.limits.maxRedpacketCount) return i.reply({ content: `❌ Max: ${config.limits.maxRedpacketCount}`, ephemeral: true });
-
-        const total = per * count;
-        if (balance.get(uid) < total) return i.reply({ content: `❌ Balance: ${balance.get(uid)} (Need: ${total})`, ephemeral: true });
-
-        balance.sub(uid, total);
-        txLog("redpacket_create", { uid, amount: total });
-
-        const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId("redpacket_claim").setLabel("🎁 CLAIM").setStyle(ButtonStyle.Primary)
-        );
-
-        let content = `🎁 **Redpacket**\n💰 ${per} × ${count} = **${total} sats**\n⏰ 60 min`;
-        if (memo) content += `\n💬 ${memo}`;
-
-        const msg = await i.reply({ content, components: [row], fetchReply: true });
-
-        stmt.insertRedpacket.run(msg.id, uid, total, count, per, i.channelId, Date.now(), memo || null);
-
-        setTimeout(() => expireRedpacket(msg.id, i.channelId), config.limits.redpacketExpiry);
-        return;
-      }
-
       case "owner_balance":
         if (uid !== config.discord.ownerId) return i.reply({ content: "❌ Owner only", ephemeral: true });
         return i.reply({ content: `💼 Owner: **${owner.get()} sats**`, ephemeral: true });
@@ -958,7 +778,6 @@ process.on("SIGTERM", shutdown);
 client.once("ready", async () => {
   console.log(`🤖 ${client.user.tag}`);
   await registerCommands();
-  restoreTimers();
   restorePendingInvoices();
   console.log("✅ Ready (SQLite)");
 });
