@@ -706,7 +706,12 @@ client.on("interactionCreate", async (i) => {
         if (!resolved.length) return i.editReply("❌ 유효한 유저가 없습니다");
 
         const finalTotal = amt * resolved.length;
-        if (balance.get(uid) < finalTotal) return i.editReply(`❌ Balance: ${balance.get(uid)} sats (Need: ${finalTotal})`);
+        if (balance.get(uid) < finalTotal) {
+          try { await i.user.send(`❌ 잔액 부족\n💰 Balance: **${balance.get(uid)} sats** (Need: **${finalTotal} sats**)`); } catch {}
+          await i.deleteReply();
+          await i.followUp({ content: `❌ 잔액이 부족합니다.\n💰 Balance: **${balance.get(uid)} sats** (Need: **${finalTotal} sats**)`, ephemeral: true });
+          return;
+        }
 
         balance.multiTransfer(uid, resolved.map(u => u.id), amt);
         for (const u of resolved) {
